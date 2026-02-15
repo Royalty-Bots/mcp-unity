@@ -18,11 +18,26 @@ namespace McpUnity.Services
     /// </summary>
     public class TestRunnerService : ITestRunnerService, ICallbacks
     {
+        private class TestRunRecord
+        {
+            public string RunId;
+            public TestMode TestMode;
+            public string Status;
+            public DateTime CreatedAtUtc;
+            public DateTime? CompletedAtUtc;
+            public JObject Result;
+            public string ErrorMessage;
+        }
+
+        private const int MaxStoredRuns = 50;
         private readonly TestRunnerApi _testRunnerApi;
         private TaskCompletionSource<JObject> _tcs;
         private bool _returnOnlyFailures;
         private bool _returnWithLogs;
         private List<ITestResultAdaptor> _results;
+        private readonly Dictionary<string, TestRunRecord> _runsById = new Dictionary<string, TestRunRecord>();
+        private readonly object _runLock = new object();
+        private string _activeRunId;
 
         /// <summary>
         /// Constructor
@@ -75,9 +90,7 @@ namespace McpUnity.Services
         {
             var filter = new Filter { testMode = testMode };
 
-            _tcs = new TaskCompletionSource<JObject>();
-            _returnOnlyFailures = returnOnlyFailures;
-            _returnWithLogs = returnWithLogs;
+            InitializeActiveRun(null, testMode, returnOnlyFailures, returnWithLogs);
 
             if (!string.IsNullOrEmpty(testFilter))
             {
@@ -88,6 +101,99 @@ namespace McpUnity.Services
 
             return await WaitForCompletionAsync(
                 McpUnitySettings.Instance.RequestTimeoutSeconds);
+        }
+
+        /// <summary>
+        /// Starts a test run and returns a run id immediately.
+        /// </summary>
+        public Task<JObject> StartTestRunAsync(TestMode testMode, bool returnOnlyFailures, bool returnWithLogs, string testFilter = "")
+        {
+            var filter = new Filter { testMode = testMode };
+            if (!string.IsNullOrEmpty(testFilter))
+            {
+                filter.testNames = new[] { testFilter };
+            }
+
+            string runId = Guid.NewGuid().ToString("N");
+            string activeRunId;
+
+            lock (_runLock)
+            {
+                activeRunId = _activeRunId;
+            }
+
+            if (!string.IsNullOrEmpty(activeRunId) && GetRunStatus(activeRunId) == "running")
+            {
+                return Task.FromResult<JObject>(new JObject
+                {
+                    ["success"] = false,
+                    ["type"] = "text",
+                    ["message"] = $"Another test run is already in progress: {activeRunId}",
+                    ["error"] = "test_run_in_progress",
+                    ["runId"] = activeRunId
+                });
+            }
+
+            InitializeActiveRun(runId, testMode, returnOnlyFailures, returnWithLogs);
+            _testRunnerApi.Execute(new ExecutionSettings(filter));
+
+            return Task.FromResult<JObject>(new JObject
+            {
+                ["success"] = true,
+                ["type"] = "text",
+                ["message"] = $"Test run started: {runId}",
+                ["runId"] = runId,
+                ["status"] = "running",
+                ["testMode"] = testMode.ToString()
+            });
+        }
+
+        /// <summary>
+        /// Gets the status of a previously started run.
+        /// </summary>
+        public JObject GetTestRunStatus(string runId)
+        {
+            if (string.IsNullOrEmpty(runId))
+            {
+                return McpUnitySocketHandler.CreateErrorResponse("Missing runId", "invalid_request");
+            }
+
+            TestRunRecord run;
+            lock (_runLock)
+            {
+                if (!_runsById.TryGetValue(runId, out run))
+                {
+                    return McpUnitySocketHandler.CreateErrorResponse($"Unknown runId: {runId}", "not_found");
+                }
+            }
+
+            var statusResponse = new JObject
+            {
+                ["success"] = true,
+                ["type"] = "text",
+                ["runId"] = runId,
+                ["status"] = run.Status,
+                ["testMode"] = run.TestMode.ToString(),
+                ["createdAtUtc"] = run.CreatedAtUtc.ToString("o"),
+                ["message"] = $"Test run {run.Status}: {runId}"
+            };
+
+            if (run.CompletedAtUtc.HasValue)
+            {
+                statusResponse["completedAtUtc"] = run.CompletedAtUtc.Value.ToString("o");
+            }
+
+            if (!string.IsNullOrEmpty(run.ErrorMessage))
+            {
+                statusResponse["errorMessage"] = run.ErrorMessage;
+            }
+
+            if (run.Result != null)
+            {
+                statusResponse["result"] = run.Result;
+            }
+
+            return statusResponse;
         }
         
         /// <summary>
@@ -170,6 +276,7 @@ namespace McpUnity.Services
                 return;
             
             var summary = BuildResultJson(_results, result);
+            MarkRunCompleted(summary, null);
             _tcs.TrySetResult(summary);
             _tcs = null;
         }
@@ -185,12 +292,98 @@ namespace McpUnity.Services
             
             if (winner != _tcs.Task)
             {
-                _tcs.TrySetResult(
+                var timeoutResult =
                     McpUnitySocketHandler.CreateErrorResponse(
                         $"Test run timed out after {timeoutSeconds} seconds",
-                        "test_runner_timeout"));
+                        "test_runner_timeout");
+
+                MarkRunCompleted(timeoutResult, "timeout");
+                _tcs.TrySetResult(timeoutResult);
             }
             return await _tcs.Task;
+        }
+
+        private void InitializeActiveRun(string runId, TestMode testMode, bool returnOnlyFailures, bool returnWithLogs)
+        {
+            _tcs = new TaskCompletionSource<JObject>();
+            _returnOnlyFailures = returnOnlyFailures;
+            _returnWithLogs = returnWithLogs;
+
+            if (string.IsNullOrEmpty(runId))
+            {
+                lock (_runLock)
+                {
+                    _activeRunId = null;
+                }
+                return;
+            }
+
+            var record = new TestRunRecord
+            {
+                RunId = runId,
+                TestMode = testMode,
+                Status = "running",
+                CreatedAtUtc = DateTime.UtcNow
+            };
+
+            lock (_runLock)
+            {
+                _activeRunId = runId;
+                _runsById[runId] = record;
+                PruneRunsIfNeeded();
+            }
+        }
+
+        private void MarkRunCompleted(JObject summary, string errorMessage)
+        {
+            lock (_runLock)
+            {
+                if (string.IsNullOrEmpty(_activeRunId))
+                {
+                    return;
+                }
+
+                if (_runsById.TryGetValue(_activeRunId, out var record))
+                {
+                    record.Result = summary;
+                    record.CompletedAtUtc = DateTime.UtcNow;
+                    record.ErrorMessage = errorMessage;
+                    record.Status = summary?["error"] != null ? "failed" : "completed";
+                }
+
+                _activeRunId = null;
+            }
+        }
+
+        private string GetRunStatus(string runId)
+        {
+            lock (_runLock)
+            {
+                if (_runsById.TryGetValue(runId, out var record))
+                {
+                    return record.Status;
+                }
+            }
+
+            return "unknown";
+        }
+
+        private void PruneRunsIfNeeded()
+        {
+            if (_runsById.Count <= MaxStoredRuns)
+            {
+                return;
+            }
+
+            var oldest = _runsById.Values
+                .OrderBy(r => r.CreatedAtUtc)
+                .Take(_runsById.Count - MaxStoredRuns)
+                .ToList();
+
+            foreach (var run in oldest)
+            {
+                _runsById.Remove(run.RunId);
+            }
         }
 
         private JObject BuildResultJson(List<ITestResultAdaptor> results, ITestResultAdaptor result)

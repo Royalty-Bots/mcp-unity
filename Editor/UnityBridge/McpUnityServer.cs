@@ -42,6 +42,8 @@ namespace McpUnity.Unity
         private CancellationTokenSource _cts;
         private TestRunnerService _testRunnerService;
         private ConsoleLogsService _consoleLogsService;
+        private readonly Queue<string> _pendingResponses = new Queue<string>();
+        private readonly object _pendingResponsesLock = new object();
         
         /// <summary>
         /// Called after every domain reload
@@ -90,6 +92,44 @@ namespace McpUnity.Unity
         /// Dictionary of connected clients with this server
         /// </summary>
         public Dictionary<string, string> Clients { get; } = new Dictionary<string, string>();
+
+        /// <summary>
+        /// Queue a response payload when a client disconnects before the response can be sent.
+        /// These responses are flushed on the next client connection.
+        /// </summary>
+        public void EnqueuePendingResponse(string responsePayload)
+        {
+            if (string.IsNullOrEmpty(responsePayload))
+            {
+                return;
+            }
+
+            lock (_pendingResponsesLock)
+            {
+                // Bound queue growth in case clients remain disconnected.
+                if (_pendingResponses.Count >= 100)
+                {
+                    _pendingResponses.Dequeue();
+                }
+                _pendingResponses.Enqueue(responsePayload);
+            }
+        }
+
+        /// <summary>
+        /// Dequeue all pending response payloads.
+        /// </summary>
+        public List<string> DequeueAllPendingResponses()
+        {
+            lock (_pendingResponsesLock)
+            {
+                var payloads = new List<string>(_pendingResponses.Count);
+                while (_pendingResponses.Count > 0)
+                {
+                    payloads.Add(_pendingResponses.Dequeue());
+                }
+                return payloads;
+            }
+        }
 
         /// <summary>
         /// Private constructor to enforce singleton pattern
@@ -324,6 +364,14 @@ namespace McpUnity.Unity
             // Register RunTestsTool
             RunTestsTool runTestsTool = new RunTestsTool(_testRunnerService);
             _tools.Add(runTestsTool.Name, runTestsTool);
+
+            // Register StartTestRunTool
+            StartTestRunTool startTestRunTool = new StartTestRunTool(_testRunnerService);
+            _tools.Add(startTestRunTool.Name, startTestRunTool);
+
+            // Register GetTestRunStatusTool
+            GetTestRunStatusTool getTestRunStatusTool = new GetTestRunStatusTool(_testRunnerService);
+            _tools.Add(getTestRunStatusTool.Name, getTestRunStatusTool);
             
             // Register SendConsoleLogTool
             SendConsoleLogTool sendConsoleLogTool = new SendConsoleLogTool();
