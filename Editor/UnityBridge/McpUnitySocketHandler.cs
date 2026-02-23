@@ -263,6 +263,16 @@ namespace McpUnity.Unity
         /// </summary>
         private void SendOrQueueResponse(string responsePayload, string requestId)
         {
+            // During PlayMode transitions the original session is often already gone by the time
+            // an async tool finishes. In that case, queue immediately for the next reconnect.
+            if (!_server.Clients.ContainsKey(ID))
+            {
+                McpLogger.LogInfo(
+                    $"No active client session for request '{requestId ?? "unknown"}'. Queuing response for next reconnect.");
+                _server.EnqueuePendingResponse(responsePayload);
+                return;
+            }
+
             try
             {
                 Send(responsePayload);
