@@ -86,7 +86,7 @@ async function toolHandler(mcpUnity: McpUnity, params: any = {}): Promise<CallTo
         returnOnlyFailures,
         returnWithLogs
       }
-    });
+    }, { timeout: 10000, queueIfDisconnected: true });
 
     if (!start.success || !start.runId) {
       throw new McpUnityError(
