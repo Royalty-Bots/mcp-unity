@@ -65,7 +65,9 @@ namespace McpUnity.Unity
                 {
                     McpLogger.LogError($"Invalid JSON received: {jre.Message}. Data: {e.Data}");
                     // Attempt to send a parse error response. No requestId is available yet.
-                    Send(CreateResponse(null, CreateErrorResponse($"Invalid JSON format: {jre.Message}", "invalid_json")).ToString(Formatting.None));
+                    SendOrQueueResponse(
+                        CreateResponse(null, CreateErrorResponse($"Invalid JSON format: {jre.Message}", "invalid_json")).ToString(Formatting.None),
+                        "invalid_json");
                     return;
                 }
 
@@ -98,14 +100,17 @@ namespace McpUnity.Unity
                 
                 McpLogger.LogInfo($"WebSocket message response for request ID '{requestId}': {responseStr}");
                 
-                // Send the response back to the client
-                Send(responseStr);
+                // Send the response back to the client. If the connection dropped (for example during
+                // PlayMode reconnect), queue the payload and flush it when the next client connects.
+                SendOrQueueResponse(responseStr, requestId);
             }
             catch (Exception ex)
             {
                 McpLogger.LogError($"Error processing message: {ex.Message}");
                 
-                Send(CreateErrorResponse($"Internal server error: {ex.Message}", "internal_error").ToString(Formatting.None));
+                SendOrQueueResponse(
+                    CreateErrorResponse($"Internal server error: {ex.Message}", "internal_error").ToString(Formatting.None),
+                    "internal_error");
             }
         }
         
@@ -126,6 +131,26 @@ namespace McpUnity.Unity
             _server.Clients[ID] = clientName;
             
             McpLogger.LogInfo($"WebSocket client connected (ID: {ID}, Name: {(string.IsNullOrEmpty(clientName) ? "Unknown" : clientName)})");
+
+            // Flush queued responses from a prior disconnected client session.
+            var pendingPayloads = _server.DequeueAllPendingResponses();
+            if (pendingPayloads.Count > 0)
+            {
+                McpLogger.LogInfo($"Flushing {pendingPayloads.Count} queued response(s) to reconnected client {ID}.");
+                foreach (var payload in pendingPayloads)
+                {
+                    try
+                    {
+                        Send(payload);
+                    }
+                    catch (Exception ex)
+                    {
+                        McpLogger.LogWarning($"Failed while flushing queued response to client {ID}: {ex.Message}");
+                        // Requeue current payload and remaining payloads for the next reconnect.
+                        _server.EnqueuePendingResponse(payload);
+                    }
+                }
+            }
         }
         
         /// <summary>
@@ -231,6 +256,33 @@ namespace McpUnity.Unity
             }
             
             return jsonRpcResponse;
+        }
+
+        /// <summary>
+        /// Attempt to send a response to the active socket and queue it if the socket is unavailable.
+        /// </summary>
+        private void SendOrQueueResponse(string responsePayload, string requestId)
+        {
+            // During PlayMode transitions the original session is often already gone by the time
+            // an async tool finishes. In that case, queue immediately for the next reconnect.
+            if (!_server.Clients.ContainsKey(ID))
+            {
+                McpLogger.LogInfo(
+                    $"No active client session for request '{requestId ?? "unknown"}'. Queuing response for next reconnect.");
+                _server.EnqueuePendingResponse(responsePayload);
+                return;
+            }
+
+            try
+            {
+                Send(responsePayload);
+            }
+            catch (Exception ex)
+            {
+                McpLogger.LogWarning(
+                    $"Send failed for request '{requestId ?? "unknown"}'. Queuing response for next client reconnect. Error: {ex.Message}");
+                _server.EnqueuePendingResponse(responsePayload);
+            }
         }
     }
 }

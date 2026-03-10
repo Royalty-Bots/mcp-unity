@@ -13,6 +13,7 @@ interface PendingRequest {
   resolve: (value: any) => void;
   reject: (reason: any) => void;
   timeout: NodeJS.Timeout;
+  preserveOnReconnect: boolean;
 }
 
 interface UnityRequest {
@@ -149,8 +150,9 @@ export class McpUnity {
 
       this.connection.on('error', (error: McpUnityError) => {
         this.logger.error(`Connection error: ${error.message}`);
-        // Reject pending requests on connection error
-        this.rejectAllPendingRequests(error);
+        // During PlayMode/domain reload reconnects, Unity may still flush queued responses
+        // for in-flight requests after the socket comes back. Keep reconnect-safe requests alive.
+        this.rejectPendingRequests(error, false);
       });
 
       this.logger.info('Attempting to connect to Unity WebSocket...');
@@ -285,12 +287,19 @@ export class McpUnity {
   /**
    * Reject all pending requests with an error
    */
-  private rejectAllPendingRequests(error: McpUnityError): void {
+  private rejectPendingRequests(error: McpUnityError, includeReconnectSafe: boolean): void {
     for (const [id, request] of this.pendingRequests.entries()) {
+      if (!includeReconnectSafe && request.preserveOnReconnect) {
+        continue;
+      }
       clearTimeout(request.timeout);
       request.reject(error);
       this.pendingRequests.delete(id);
     }
+  }
+
+  private rejectAllPendingRequests(error: McpUnityError): void {
+    this.rejectPendingRequests(error, true);
   }
 
   /**
@@ -325,7 +334,7 @@ export class McpUnity {
 
     // If connected, send directly
     if (this.isConnected) {
-      return this.sendRequestInternal(message, timeout);
+      return this.sendRequestInternal(message, timeout, queueIfDisconnected);
     }
 
     // If not started, throw error
@@ -378,7 +387,7 @@ export class McpUnity {
     try {
       await this.connection.connect();
       // Connection successful, send the request
-      return this.sendRequestInternal(message, timeout);
+      return this.sendRequestInternal(message, timeout, queueIfDisconnected);
     } catch (error) {
       // Connection failed - if queuing is enabled, queue the command
       if (queueIfDisconnected) {
@@ -410,7 +419,7 @@ export class McpUnity {
    * Internal method to send a request directly to Unity
    * Bypasses queuing logic - assumes connection is already established
    */
-  private sendRequestInternal(request: UnityRequest, customTimeout?: number): Promise<any> {
+  private sendRequestInternal(request: UnityRequest, customTimeout?: number, preserveOnReconnect: boolean = false): Promise<any> {
     const requestId = request.id as string;
     const timeoutMs = customTimeout ?? this.requestTimeout;
 
@@ -438,7 +447,8 @@ export class McpUnity {
       this.pendingRequests.set(requestId, {
         resolve,
         reject,
-        timeout
+        timeout,
+        preserveOnReconnect
       });
 
       try {
